@@ -5,26 +5,20 @@
     venv\\Scripts\\pyinstaller oms.spec --clean --noconfirm
 
 产物:
-    dist\\oms.exe (single-file, ~80MB)
-"""
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+    dist\\oms.exe
 
-# akshare 及其底层 HTTP / JS 引擎依赖：都要完整收录
+注意: tqcenter 不打包进 exe — 它随通达信终端发布，运行时通过
+`sys.path.append(config.TDX_USER_PATH)` 引入。因此产出的 exe 仍需
+要在装有通达信金融终端的机器上运行。
+"""
+from PyInstaller.utils.hooks import collect_submodules
+
 hiddenimports = []
 datas = []
 binaries = []
 
-for pkg in ("akshare", "mini_racer", "curl_cffi", "py_mini_racer"):
-    try:
-        pdatas, pbinaries, phidden = collect_all(pkg)
-        datas += pdatas
-        binaries += pbinaries
-        hiddenimports += phidden
-    except Exception:
-        pass
-
-# 保险起见再补子模块
-for pkg in ("akshare", "pandas"):
+# 只需要保证 pandas / numpy 的子模块收录齐
+for pkg in ("pandas", "numpy"):
     try:
         hiddenimports += collect_submodules(pkg)
     except Exception:
@@ -41,7 +35,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # 剔除常见大体积但本项目用不到的模块
         "tkinter",
         "matplotlib",
         "PyQt5",
@@ -51,6 +44,10 @@ a = Analysis(
         "jupyter",
         "sphinx",
         "pytest",
+        "akshare",
+        "mini_racer",
+        "curl_cffi",
+        "py_mini_racer",
     ],
     noarchive=False,
     optimize=0,

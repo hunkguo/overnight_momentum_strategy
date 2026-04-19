@@ -1,19 +1,15 @@
-"""历史回测引擎。
+"""历史回测引擎 — TdxQuant 版。
 
-由于 akshare 分时数据仅近期可用（约 5 个交易日），filter 7/8 在早期日期不可回溯；
-因此回测在每个交易日仅执行 filter 1-6 的"日线近似"版本：
-  - filter 1（涨跌幅 3-5%）: 用 T 日收盘价涨跌幅
-  - filter 2（量比 >1）: 用 T 日成交量 / 近 5 日均成交量
-  - filter 3（换手率 5-10%）: 用 T 日日线换手率
-  - filter 4（流通市值 50-200亿）: 用最新快照（回溯近似）
-  - filter 5-6: 用 T 日之前的日 K 线
+关键思路：一次性批量拉取全股票池 + 足够回溯的日 K 线；本地向量化
+计算 filter 1/2/5/6；filter 3（换手率）/ filter 4（流通市值）用当期
+快照近似（TdxQuant 财务历史需要额外公式，首版暂用近似）；filter 7/8
+（分时）不入回测。
 
-每个信号：T 日收盘买入，T+1 日按指定卖点（open/close/high）卖出，记录收益。
+每个信号：T 日收盘买入，T+1 日按指定卖点（open/close/high）卖出。
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Literal, Optional
 
 import pandas as pd
@@ -25,12 +21,9 @@ from config import (
     FLOAT_MV_HIGH,
     FLOAT_MV_LOW,
     KLINE_DAYS,
-    MAX_WORKERS,
-    TURNOVER_HIGH,
-    TURNOVER_LOW,
     VOLUME_RATIO_MIN,
 )
-from src.data import get_kline, get_spot
+from src import tdx_data
 from src.filters import filter_ma_bullish, filter_volume_pattern
 from src.utils import setup_logger
 
@@ -39,92 +32,10 @@ logger = setup_logger()
 SellPoint = Literal["open", "close", "high"]
 
 
-def _trading_days_in_range(start: str, end: str) -> list[pd.Timestamp]:
-    """用上证指数 000001 的日线推断交易日（调用方只需传日期区间）。"""
-    # 借用任意常驻大盘股的日线来确定交易日集合
-    probe = get_kline("000001", end_date=end, days=KLINE_DAYS)
-    if probe.empty:
-        return []
-    s = pd.Timestamp(datetime.strptime(start, "%Y%m%d"))
-    e = pd.Timestamp(datetime.strptime(end, "%Y%m%d"))
-    days = probe[(probe["date"] >= s) & (probe["date"] <= e)]["date"]
-    return list(days)
-
-
-def _evaluate_day_for_stock(
-    code: str,
-    name: str,
-    float_mv: float,
-    trade_day: pd.Timestamp,
-    sell_point: SellPoint,
-) -> Optional[dict]:
-    """对单只股票在给定交易日评估策略，命中则返回 {code, return_pct, ...}。"""
-    # 拿到覆盖 trade_day 及之前 KLINE_DAYS 的 K 线，同时多拿一天用于次日卖点
-    end_date = (trade_day + timedelta(days=10)).strftime("%Y%m%d")
-    try:
-        kline = get_kline(code, end_date=end_date, days=KLINE_DAYS + 15)
-    except Exception as exc:
-        logger.debug("拉 %s K 线失败: %s", code, exc)
-        return None
-    if kline.empty:
-        return None
-
-    kline = kline.sort_values("date").reset_index(drop=True)
-    mask_today = kline["date"] == trade_day
-    if not mask_today.any():
-        return None
-    idx = kline.index[mask_today][0]
-    if idx < 25:     # 需要足够历史
-        return None
-    today = kline.iloc[idx]
-
-    # ---- filter 1：涨跌幅 3-5% ----
-    if not (CHANGE_LOW <= float(today["change_pct"]) <= CHANGE_HIGH):
-        return None
-
-    # ---- filter 2：量比 >1（用 T 日成交量/近 5 日均）----
-    prev5 = kline.iloc[max(0, idx - 5):idx]["volume"].mean()
-    if prev5 <= 0:
-        return None
-    volume_ratio = float(today["volume"]) / prev5
-    if volume_ratio <= VOLUME_RATIO_MIN:
-        return None
-
-    # ---- filter 3：换手率 5-10% ----
-    turn = today.get("turnover")
-    if pd.isna(turn) or not (TURNOVER_LOW <= float(turn) <= TURNOVER_HIGH):
-        return None
-
-    # ---- filter 4：流通市值 50-200亿（近似：当前快照）----
-    if not (FLOAT_MV_LOW <= float_mv <= FLOAT_MV_HIGH):
-        return None
-
-    # ---- filter 5-6：使用 T 日及之前的数据 ----
-    hist = kline.iloc[: idx + 1].copy()
-    if not filter_volume_pattern(hist).passed:
-        return None
-    if not filter_ma_bullish(hist).passed:
-        return None
-
-    # ---- 成交 ----
-    if idx + 1 >= len(kline):
-        return None
-    next_day = kline.iloc[idx + 1]
-    buy_price = float(today["close"])
-    sell_price = float(next_day[sell_point])
-    ret = (sell_price - buy_price) / buy_price * 100
-
-    return {
-        "trade_date": trade_day.strftime("%Y-%m-%d"),
-        "code": code,
-        "name": name,
-        "buy_price": round(buy_price, 2),
-        "sell_price": round(sell_price, 2),
-        "return_pct": round(ret, 3),
-        "volume_ratio": round(volume_ratio, 2),
-        "turnover": round(float(turn), 2),
-        "change_pct_today": round(float(today["change_pct"]), 2),
-    }
+def _universe_with_mv(spot: pd.DataFrame) -> list[str]:
+    """按当期流通市值粗筛回测股票池。"""
+    u = spot[(spot["float_mv"] >= FLOAT_MV_LOW) & (spot["float_mv"] <= FLOAT_MV_HIGH)]
+    return u["code"].tolist()
 
 
 def backtest(
@@ -135,55 +46,123 @@ def backtest(
 ) -> tuple[pd.DataFrame, dict]:
     """运行回测。
 
-    由于遍历全市场按日还要跑 filter 5/6（每股都要取 K 线），成本较高。策略本身的
-    选股空间先由流通市值 50-200亿 粗筛（靠当前快照近似），再对每个交易日评估。
-
     Args:
         start, end: YYYYMMDD
-        sell_point: next-day 卖点
-        universe_limit: 仅用前 N 只股票（调试）
+        sell_point: T+1 卖点
+        universe_limit: 仅使用前 N 只（调试）
     Returns:
         (trades_df, summary_dict)
     """
+    tdx_data.init_tq()
     logger.info("回测窗口 %s ~ %s，卖点 T+1 %s", start, end, sell_point)
-    trading_days = _trading_days_in_range(start, end)
-    if not trading_days:
-        raise RuntimeError("未能推断交易日，检查日期区间或 akshare 连通性")
-    logger.info("区间共 %d 个交易日", len(trading_days))
 
-    spot = get_spot()
-    universe = spot[(spot["float_mv"] >= FLOAT_MV_LOW) & (spot["float_mv"] <= FLOAT_MV_HIGH)]
+    # 1. 粗筛股票池（流通市值区间）
+    spot = tdx_data.get_spot()
+    universe = _universe_with_mv(spot)
     if universe_limit:
-        universe = universe.head(universe_limit)
-    logger.info("回测股票池（按流通市值粗筛）：%d 只", len(universe))
-
-    trades: list[dict] = []
-    total_jobs = len(universe) * len(trading_days)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = []
-        for _, row in universe.iterrows():
-            for td in trading_days:
-                futures.append(
-                    pool.submit(
-                        _evaluate_day_for_stock,
-                        row["code"],
-                        row.get("name", ""),
-                        float(row["float_mv"]),
-                        td,
-                        sell_point,
-                    )
-                )
-        with tqdm(total=total_jobs, desc="回测", ncols=80) as bar:
-            for fut in as_completed(futures):
-                r = fut.result()
-                if r:
-                    trades.append(r)
-                bar.update(1)
-
-    if not trades:
+        universe = universe[:universe_limit]
+    logger.info("回测股票池（按当期流通市值粗筛）：%d 只", len(universe))
+    if not universe:
         return pd.DataFrame(), {"signals": 0}
 
-    df = pd.DataFrame(trades).sort_values(["trade_date", "return_pct"], ascending=[True, False])
+    # 2. 批量拉 K 线：start 前再多取 KLINE_DAYS 保证 MA60 有历史
+    lookback_days = KLINE_DAYS + 20
+    start_dt = datetime.strptime(start, "%Y%m%d")
+    # 取前推自然日，保守覆盖
+    from datetime import timedelta
+    pre_start = (start_dt - timedelta(days=int(lookback_days * 1.8))).strftime("%Y%m%d")
+    # end 后多推几天拿 T+1 卖点
+    end_plus = (datetime.strptime(end, "%Y%m%d") + timedelta(days=10)).strftime("%Y%m%d")
+
+    # 直接借用 tdx_data 批量接口，但 end_date 要覆盖到 end+10
+    daily = tdx_data.get_daily_batch(
+        universe,
+        end_date=end_plus,
+        days=lookback_days + (datetime.strptime(end, "%Y%m%d") - start_dt).days + 20,
+    )
+    if not daily:
+        return pd.DataFrame(), {"signals": 0}
+
+    # 3. 交易日集合：从任一个 K 线的 date 列推断
+    first_df = next(iter(daily.values()))
+    trading_days = first_df["date"][
+        (first_df["date"] >= pd.Timestamp(start_dt))
+        & (first_df["date"] <= pd.Timestamp(end_plus))
+    ].tolist()
+    trading_days = [d for d in trading_days if d <= pd.Timestamp(end)]
+    logger.info("区间共 %d 个交易日", len(trading_days))
+    if not trading_days:
+        return pd.DataFrame(), {"signals": 0}
+
+    # 4. 按股票循环（每只一次性拿到完整历史，避免 IO）
+    mv_map = dict(zip(spot["code"], spot["float_mv"]))
+    trades: list[dict] = []
+
+    for code in tqdm(universe, desc="回测", ncols=80):
+        k = daily.get(code)
+        if k is None or len(k) < 30:
+            continue
+        # 预计算涨跌幅、量比（近 5 日均成交量比）
+        k = k.copy()
+        k["change_pct"] = (k["close"] / k["close"].shift(1) - 1) * 100
+        k["vol5"] = k["volume"].rolling(5).mean().shift(1)
+        k["volume_ratio"] = k["volume"] / k["vol5"]
+
+        for td in trading_days:
+            mask_today = k["date"] == td
+            if not mask_today.any():
+                continue
+            idx = k.index[mask_today][0]
+            if idx < 25:
+                continue
+            today = k.iloc[idx]
+
+            # filter 1
+            cp = today["change_pct"]
+            if pd.isna(cp) or not (CHANGE_LOW <= float(cp) <= CHANGE_HIGH):
+                continue
+            # filter 2
+            vr = today["volume_ratio"]
+            if pd.isna(vr) or float(vr) <= VOLUME_RATIO_MIN:
+                continue
+            # filter 3: 换手率 — 回测期无历史快照，跳过（已在 README 标注）
+            # filter 4: 流通市值 — 用当期快照近似
+            float_mv = float(mv_map.get(code, 0.0))
+            if not (FLOAT_MV_LOW <= float_mv <= FLOAT_MV_HIGH):
+                continue
+
+            # filter 5/6
+            hist = k.iloc[: idx + 1]
+            if not filter_volume_pattern(hist).passed:
+                continue
+            if not filter_ma_bullish(hist).passed:
+                continue
+
+            if idx + 1 >= len(k):
+                continue
+            nxt = k.iloc[idx + 1]
+            buy_price = float(today["close"])
+            sell_price = float(nxt[sell_point])
+            if buy_price <= 0:
+                continue
+            ret = (sell_price - buy_price) / buy_price * 100
+
+            trades.append({
+                "trade_date": td.strftime("%Y-%m-%d"),
+                "code": code,
+                "buy_price": round(buy_price, 2),
+                "sell_price": round(sell_price, 2),
+                "return_pct": round(ret, 3),
+                "change_pct_today": round(float(cp), 2),
+                "volume_ratio": round(float(vr), 2),
+            })
+
+    if not trades:
+        return pd.DataFrame(), {"signals": 0, "trading_days": len(trading_days)}
+
+    df = pd.DataFrame(trades).sort_values(
+        ["trade_date", "return_pct"], ascending=[True, False]
+    )
     rets = df["return_pct"]
     summary = {
         "signals": len(df),

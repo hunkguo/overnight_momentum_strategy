@@ -1,12 +1,17 @@
 """Overnight Momentum Strategy — CLI 入口。
 
+基于 TdxQuant（通达信本地终端）获取数据。首次运行前请先：
+  1) 启动通达信金融终端并确认「TQ 策略」菜单就绪；
+  2) 核对 config.TDX_USER_PATH 指向正确的 PYPlugins/user 目录；
+  3) 在「TQ 策略 → TQ 数据设置 → 盘后数据下载」补齐近 30 天日线数据。
+
 用法:
   python main.py scan                              # 实时扫描（8 步全流程）
-  python main.py scan --stage coarse               # 仅跑 filter 1-4（非交易时段验证）
-  python main.py scan --stage no-intraday          # 跑到 filter 6 为止
-  python main.py scan --top 20 --no-save
-  python main.py backtest --start 20260401 --end 20260418
-  python main.py backtest --start 20260401 --end 20260418 --sell open --limit 500
+  python main.py scan --stage coarse               # 仅跑 filter 1-4
+  python main.py scan --stage no-intraday          # 跑到 filter 6
+  python main.py scan --top 20 --push-block --notify
+  python main.py backtest --start 20260301 --end 20260418
+  python main.py backtest --start 20260301 --end 20260418 --sell open --limit 500
 """
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import argparse
 import sys
 from datetime import datetime
 
+from config import PUSH_BLOCK_CODE, PUSH_BLOCK_NAME
 from src.backtest import backtest
 from src.selector import scan
 from src.selftest import run_selftest
@@ -28,11 +34,28 @@ def cmd_scan(args: argparse.Namespace) -> int:
     print_candidates_table(df)
     if df is None or df.empty:
         logger.info("无候选股票")
+        if args.notify:
+            from src.tdx_data import init_tq, send_message
+            init_tq()
+            send_message(f"{datetime.now():%H:%M} OMS 扫描无候选")
         return 0
     if not args.no_save:
         fname = f"scan_{datetime.now():%Y%m%d}.csv"
         path = save_csv(df, fname)
         logger.info("已保存 %s（%d 只，同日覆盖写入）", path, len(df))
+
+    if args.push_block:
+        from src.tdx_data import init_tq, send_to_block
+        init_tq()
+        send_to_block(df["code"].tolist(), PUSH_BLOCK_CODE, PUSH_BLOCK_NAME)
+
+    if args.notify:
+        from src.tdx_data import init_tq, send_message
+        init_tq()
+        top3 = ",".join(df["code"].head(3).tolist())
+        send_message(
+            f"{datetime.now():%H:%M} OMS 命中 {len(df)} 只，前 3：{top3}"
+        )
     return 0
 
 
@@ -68,7 +91,6 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     fname = f"backtest_{args.start}_{args.end}_{args.sell}.csv"
     path = save_csv(df, fname)
     logger.info("明细已保存 %s（%d 条）", path, len(df))
-    # 前 20 条预览
     print_candidates_table(df.head(20))
     return 0
 
@@ -76,7 +98,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="oms",
-        description="Overnight Momentum Strategy 选股程序（A 股）",
+        description="Overnight Momentum Strategy 选股程序（A 股 / TdxQuant）",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -89,6 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scan.add_argument("--top", type=int, default=None, help="仅展示前 N 只")
     p_scan.add_argument("--no-save", action="store_true", help="不保存 CSV")
+    p_scan.add_argument(
+        "--push-block",
+        action="store_true",
+        help=f"把结果写入 TDX 自定义板块（{PUSH_BLOCK_CODE}/{PUSH_BLOCK_NAME}）",
+    )
+    p_scan.add_argument(
+        "--notify",
+        action="store_true",
+        help="通过 tq.send_message 向 TQ 策略管理器发消息",
+    )
     p_scan.set_defaults(func=cmd_scan)
 
     p_bt = sub.add_parser("backtest", help="历史回测")

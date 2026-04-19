@@ -29,20 +29,33 @@ MA_PERIODS: tuple[int, ...] = (5, 10, 20, 60)
 
 # ---- Filter 7: 分时强势 ----
 INTRADAY_ABOVE_VWAP_RATIO: float = 0.8   # 当日 ≥ 该比例时间 股价 > 均价线
-INDEX_SYMBOL: str = "000001"             # 上证指数（akshare 分时接口不带 sh 前缀）
 
 # ---- Filter 8: 回踩均价线不破 ----
 PULLBACK_TOLERANCE: float = 0.005        # 回踩允许误差 0.5%
 PULLBACK_WINDOW_START: str = "14:00"     # 观察窗口起点
 PULLBACK_WINDOW_END: str = "14:55"
 
-# ---- 数据拉取/并发 ----
-MAX_WORKERS: int = 4                     # 东方财富对 IP 限流，降低并发
+# ---- TdxQuant 环境 ----
+# tqcenter.py 所在目录：<通达信安装目录>/PYPlugins/user
+TDX_USER_PATH: str = "D:/new_tdx64/PYPlugins/user"
+
+# ---- 股票池 ----
+# 'market' → tq.get_stock_list(market=UNIVERSE_MARKET)
+# 'sector' → tq.get_stock_list_in_sector(UNIVERSE_SECTOR)
+UNIVERSE_MODE: str = "market"
+UNIVERSE_MARKET: str = "5"               # 5 = 沪深 A 股全部
+UNIVERSE_SECTOR: str = "沪深A股"          # UNIVERSE_MODE='sector' 时使用
+
+# ---- 自定义板块（--push-block 开启时生效）----
+PUSH_BLOCK_CODE: str = "OMS"
+PUSH_BLOCK_NAME: str = "尾盘动量隔夜"
+
+# ---- 指数代码（filter 7 对比大盘用）----
+# 上证指数：通达信传统代码 999999.SH；若你的版本用新代码可改为 000001.SH
+INDEX_SYMBOL: str = "999999.SH"
+
+# ---- 数据拉取 ----
 KLINE_DAYS: int = 120                    # 日 K 线回溯天数（覆盖 MA60）
-RETRY_TIMES: int = 5
-RETRY_BACKOFF: float = 2.0               # 指数退避基数：2^n 秒
-RETRY_BASE_DELAY: float = 3.0            # 首次退避基线
-REQUEST_INTERVAL: float = 0.15           # 每次请求最小间隔（节流）
 
 # ---- 输出目录 ----
 OUTPUT_DIR: str = "output"

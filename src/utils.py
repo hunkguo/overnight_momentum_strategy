@@ -61,8 +61,17 @@ def setup_logger(name: str = "oms") -> logging.Logger:
 
 
 def normalize_symbol(code: str) -> str:
-    """把任意形式的股票代码标准化为 6 位纯数字字符串。"""
+    """把任意形式的股票代码标准化为 6 位纯数字字符串。
+
+    支持输入：`'600519'` / `'sh600519'` / `'600519.SH'` / `'sz000001'`。
+    """
     code = str(code).strip().lower()
+    # TDX 风格 'xxxxxx.sh' / 'xxxxxx.sz' / 'xxxxxx.bj'
+    for suffix in (".sh", ".sz", ".bj"):
+        if code.endswith(suffix):
+            code = code[: -len(suffix)]
+            break
+    # akshare 风格 'sh600519' / 'sz000001'
     for prefix in ("sh", "sz", "bj"):
         if code.startswith(prefix):
             code = code[len(prefix):]
@@ -79,6 +88,12 @@ def infer_market_prefix(code: str) -> str:
     if code.startswith(("4", "8")):
         return "bj"
     return "sh"
+
+
+def to_tdx_code(code: str) -> str:
+    """把任意形式的股票代码转成 TdxQuant 的 `'XXXXXX.SH/SZ/BJ'` 格式。"""
+    six = normalize_symbol(code)
+    return f"{six}.{infer_market_prefix(six).upper()}"
 
 
 def compute_moving_averages(

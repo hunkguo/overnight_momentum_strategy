@@ -1,7 +1,6 @@
 """离线自检：用合成数据端到端跑一遍 filters，验证代码逻辑。
 
-由于 akshare 的东方财富端点间歇性限流（见 README 的「已知限制」），当网络访问
-被临时阻断时，仍可通过本模块验证过滤器链路正确。
+无需通达信终端 / tqcenter，也不触网，适合 CI 或打包前的回归检查。
 """
 from __future__ import annotations
 
